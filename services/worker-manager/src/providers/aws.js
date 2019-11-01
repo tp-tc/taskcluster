@@ -1,6 +1,7 @@
 const {ApiError, Provider} = require('./provider');
 const aws = require('aws-sdk');
 const taskcluster = require('taskcluster-client');
+const Entity = require('azure-entities');
 const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
@@ -52,8 +53,18 @@ class AwsProvider extends Provider {
     });
   }
 
+
   async provision({workerPool}) {
     const {workerPoolId} = workerPool;
+
+    let running = 0;
+    this.Worker.scan({
+      workerPoolId: workerPool.workerPoolId,
+      state: Entity.op.notEqual(this.Worker.states.STOPPED),
+      workerGroup: this.providerId,
+    }, {
+      handler: async worker => { running += 1 },
+    })
 
     if (!workerPool.providerData[this.providerId] || workerPool.providerData[this.providerId].running === undefined) {
       await workerPool.modify(wt => {
@@ -67,7 +78,7 @@ class AwsProvider extends Provider {
       minCapacity: workerPool.config.minCapacity,
       maxCapacity: workerPool.config.maxCapacity,
       capacityPerInstance: 1, // todo: this will be corrected along with estimator changes (bug 1579554)
-      running: workerPool.providerData[this.providerId].running,
+      running,
     });
     if (toSpawn === 0) {
       return;
@@ -219,8 +230,6 @@ class AwsProvider extends Provider {
   }
 
   async checkWorker({worker}) {
-    this.seen[worker.workerPoolId] = this.seen[worker.workerPoolId] || 0;
-
     let instanceStatuses;
     try {
       instanceStatuses = (await this.ec2s[worker.providerData.region].describeInstanceStatus({
@@ -240,7 +249,6 @@ class AwsProvider extends Provider {
         case 'running':
         case 'shutting-down': //so that we don't turn on new instances until they're entirely gone
         case 'stopping':
-          this.seen[worker.workerPoolId] += 1;
           return Promise.resolve();
 
         case 'terminated':
@@ -280,31 +288,6 @@ class AwsProvider extends Provider {
       }
 
     });
-  }
-
-  // should this be implemented on Provider? Looks like it's going to be the same for all providers
-  async scanPrepare() {
-    this.seen = {};
-    this.errors = {};
-  }
-
-  async scanCleanup() {
-    await Promise.all(Object.entries(this.seen).map(async ([workerPoolId, seen]) => {
-      const workerPool = await this.WorkerPool.load({
-        workerPoolId,
-      }, true);
-
-      if (!workerPool) {
-        return; // In this case, the worker pool has been deleted so we can just move on
-      }
-
-      await workerPool.modify(wp => {
-        if (!wp.providerData[this.providerId]) {
-          wp.providerData[this.providerId] = {};
-        }
-        wp.providerData[this.providerId].running = seen;
-      });
-    }));
   }
 
   /**
